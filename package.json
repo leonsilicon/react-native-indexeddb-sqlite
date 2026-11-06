@@ -1,0 +1,32 @@
+{
+  "name": "react-native-indexeddb-sqlite-development",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A persistent IndexedDB for React Native: fake-indexeddb with a write-through SQLite layer.",
+  "workspaces": {
+    "packages": [
+      "npm/*",
+      "packages/**"
+    ],
+    "catalog": {
+      "@matrix-org/matrix-sdk-crypto-wasm": "18.9.0",
+      "@types/node": "24.19.2",
+      "eslint-plugin-flatcap": "0.1.0",
+      "typescript": "7.0.2",
+      "vite-plus": "1.5.0"
+    }
+  },
+  "type": "module",
+  "scripts": {},
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "eslint-plugin-flatcap": "catalog:",
+    "react-native-indexeddb-sqlite": "workspace:*",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "bun@1.4.4"
+}

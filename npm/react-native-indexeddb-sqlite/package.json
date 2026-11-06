@@ -1,0 +1,57 @@
+{
+  "name": "react-native-indexeddb-sqlite",
+  "version": "0.1.0",
+  "description": "A persistent IndexedDB for React Native: fake-indexeddb in memory, written through to SQLite (expo-sqlite's synchronous API).",
+  "keywords": [
+    "expo",
+    "expo-sqlite",
+    "fake-indexeddb",
+    "indexeddb",
+    "persistence",
+    "react-native",
+    "sqlite"
+  ],
+  "homepage": "https://github.com/leonsilicon/react-native-indexeddb-sqlite#readme",
+  "bugs": "https://github.com/leonsilicon/react-native-indexeddb-sqlite/issues",
+  "license": "MIT",
+  "author": "Leon Si",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leonsilicon/react-native-indexeddb-sqlite.git",
+    "directory": "npm/react-native-indexeddb-sqlite"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./expo": {
+      "types": "./dist/expo.d.ts",
+      "default": "./dist/expo.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "fake-indexeddb": "6.2.7"
+  },
+  "devDependencies": {
+    "@matrix-org/matrix-sdk-crypto-wasm": "catalog:",
+    "@types/node": "catalog:"
+  }
+}
