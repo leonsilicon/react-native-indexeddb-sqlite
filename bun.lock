@@ -14,7 +14,7 @@
     },
     "npm/react-native-indexeddb-sqlite": {
       "name": "react-native-indexeddb-sqlite",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "dependencies": {
         "fake-indexeddb": "6.2.7",
       },

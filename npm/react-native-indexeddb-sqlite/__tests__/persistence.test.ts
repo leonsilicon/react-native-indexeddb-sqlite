@@ -187,3 +187,159 @@ test("deleteDatabase removes the data, and databases() lists what is on disk", a
   const db = await open(factory, "drop", 1, (_, __, oldVersion) => assert.equal(oldVersion, 0));
   assert.equal(db.objectStoreNames.length, 0);
 });
+
+test("records come back in key order, whatever order SQLite stored them in", async () => {
+  const file = tempDatabaseFile();
+  {
+    const { factory } = await start(file);
+    const db = await open(factory, "app", 1, (db) => {
+      const store = db.createObjectStore("s");
+      for (const key of [2, 10, 1, "b", "a", ["x", 1], ["x"], [2]]) store.put(String(key), key);
+    });
+    db.close();
+  }
+  const { factory } = await start(file);
+  const db = await open(factory, "app");
+  const keys = (await entries(db.transaction("s").objectStore("s"))).map(([key]) => key);
+  assert.deepEqual(keys, [1, 2, 10, "a", "b", [2], ["x"], ["x", 1]]);
+});
+
+async function withIndexedRecords(file: string): Promise<void> {
+  const { factory } = await start(file);
+  const db = await open(factory, "app", 1, (db) => {
+    const store = db.createObjectStore("s");
+    store.createIndex("byScore", "score");
+    store.createIndex("byPair", ["group", "score"]);
+    store.createIndex("byTag", "tags", { multiEntry: true });
+    store.put({ score: 2, group: "b", tags: ["red", "blue", "red"] }, "first");
+    store.put({ score: 10, group: "a", tags: ["blue"] }, "second");
+    store.put({ score: 2, group: "a", tags: [] }, "third");
+    store.put({ group: "a", tags: "green" }, "no score");
+  });
+  db.close();
+}
+
+test("a loaded index isn't built until it is read, and matches a freshly built one", async () => {
+  const file = tempDatabaseFile();
+  await withIndexedRecords(file);
+  const { factory, stats } = await start(file);
+  const db = await open(factory, "app");
+  const store = db.transaction("s").objectStore("s");
+  assert.deepEqual(await request(store.get("first")), {
+    score: 2,
+    group: "b",
+    tags: ["red", "blue", "red"],
+  });
+  assert.equal(stats.indexBuilds, 0);
+
+  const keysIn = async (name: string): Promise<[IDBValidKey, IDBValidKey][]> => {
+    const index = db.transaction("s").objectStore("s").index(name);
+    const found: [IDBValidKey, IDBValidKey][] = [];
+    await new Promise<void>((resolve, reject) => {
+      const r = index.openCursor();
+      r.onsuccess = () => {
+        if (!r.result) return resolve();
+        found.push([r.result.key, r.result.primaryKey]);
+        r.result.continue();
+      };
+      r.onerror = () => reject(r.error);
+    });
+    return found;
+  };
+  assert.deepEqual(await keysIn("byScore"), [
+    [2, "first"],
+    [2, "third"],
+    [10, "second"],
+  ]);
+  assert.equal(stats.indexBuilds, 1);
+  assert.deepEqual(await keysIn("byPair"), [
+    [["a", 2], "third"],
+    [["a", 10], "second"],
+    [["b", 2], "first"],
+  ]);
+  assert.deepEqual(await keysIn("byTag"), [
+    ["blue", "first"],
+    ["blue", "second"],
+    ["green", "no score"],
+    ["red", "first"],
+  ]);
+});
+
+test("writes made before an index is first read show up in it", async () => {
+  const file = tempDatabaseFile();
+  await withIndexedRecords(file);
+  const { factory, stats } = await start(file);
+  const db = await open(factory, "app");
+  const write = db.transaction("s", "readwrite");
+  write.objectStore("s").put({ score: 1, group: "c", tags: [] }, "new");
+  write.objectStore("s").put({ score: 99, group: "a", tags: [] }, "third");
+  write.objectStore("s").delete("second");
+  await done(write);
+  assert.equal(stats.indexBuilds, 0);
+
+  const index = db.transaction("s").objectStore("s").index("byScore");
+  assert.deepEqual(await request(index.getAllKeys()), ["new", "first", "third"]);
+});
+
+test("a write rolled back before an index is first read leaves no trace in it", async () => {
+  const file = tempDatabaseFile();
+  await withIndexedRecords(file);
+  const { factory, stats } = await start(file);
+  const db = await open(factory, "app");
+  const write = db.transaction("s", "readwrite");
+  const store = write.objectStore("s");
+  await request(store.put({ score: 7, group: "z", tags: [] }, "aborted"));
+  await request(store.put({ score: 8, group: "z", tags: [] }, "first"));
+  write.abort();
+  await new Promise((resolve) => (write.onabort = resolve));
+  assert.equal(stats.indexBuilds, 0);
+
+  const index = db.transaction("s").objectStore("s").index("byScore");
+  assert.deepEqual(await request(index.getAllKeys()), ["first", "third", "second"]);
+});
+
+test("a write after an index was built is kept up to date, and survives a restart", async () => {
+  const file = tempDatabaseFile();
+  await withIndexedRecords(file);
+  {
+    const { factory } = await start(file);
+    const db = await open(factory, "app");
+    const index = () => db.transaction("s").objectStore("s").index("byScore");
+    assert.deepEqual(await request(index().getAllKeys()), ["first", "third", "second"]);
+    const write = db.transaction("s", "readwrite");
+    write.objectStore("s").put({ score: 1, group: "c", tags: [] }, "new");
+    write.objectStore("s").delete("first");
+    await done(write);
+    assert.deepEqual(await request(index().getAllKeys()), ["new", "third", "second"]);
+    db.close();
+  }
+  const { factory } = await start(file);
+  const db = await open(factory, "app");
+  const index = db.transaction("s").objectStore("s").index("byScore");
+  assert.deepEqual(await request(index.getAllKeys()), ["new", "third", "second"]);
+});
+
+test("a unique index still rejects a duplicate right after a load", async () => {
+  const file = tempDatabaseFile();
+  {
+    const { factory } = await start(file);
+    const db = await open(factory, "app", 1, (db) => {
+      const store = db.createObjectStore("s");
+      store.createIndex("byEmail", "email", { unique: true });
+      store.put({ email: "a@b" }, "one");
+    });
+    db.close();
+  }
+  const { factory } = await start(file);
+  const db = await open(factory, "app");
+  const write = db.transaction("s", "readwrite");
+  const put = write.objectStore("s").put({ email: "a@b" }, "two");
+  const failure = await new Promise<string | undefined>((resolve) => {
+    put.onsuccess = () => resolve("put succeeded");
+    put.onerror = (event) => {
+      event.preventDefault();
+      resolve(put.error?.name);
+    };
+  });
+  assert.equal(failure, "ConstraintError");
+});

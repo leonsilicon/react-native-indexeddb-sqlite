@@ -5,8 +5,9 @@
 // - When an IndexedDB transaction commits, every record it touched is written to SQLite in one
 //   SQLite transaction, before `complete` fires. If that write fails, the IndexedDB transaction
 //   aborts instead (memory rolled back, `abort` fired), as a real implementation's would.
-// - A database is loaded from SQLite the first time it is opened, deleted, or listed. Indexes
-//   are not stored; they are rebuilt from the records on load.
+// - A database is loaded from SQLite the first time it is opened, deleted, or listed. Records go
+//   straight into a balanced tree in key order. Indexes are not stored; each is built from the
+//   records the first time it is read, because rebuilding them is most of the cost of a load.
 //
 // The layer hooks fake-indexeddb internals (ObjectStore, Database, Index, FDBTransaction), so
 // fake-indexeddb is pinned to the version it was written against.
@@ -46,6 +47,9 @@ export interface PersistenceStats {
   hydratedDatabases: number;
   hydratedRecords: number;
   hydrateMs: number;
+  /** Indexes built from their records since this instance started, and the time that took. */
+  indexBuilds: number;
+  indexBuildMs: number;
   /** IndexedDB transactions written to SQLite, the records written and deleted, and the time it took. */
   commits: number;
   writtenRecords: number;
@@ -105,6 +109,49 @@ interface Internals {
   Index: Raw;
 }
 
+// What `compareKeys` falls back on for the key types it has no shortcut for.
+const keyOrder = new FakeIDBFactory();
+
+/**
+ * Orders two valid IndexedDB keys the way `indexedDB.cmp` does. Loading calls this for every
+ * record, and strings and numbers (most keys) don't need the type checks `cmp` makes.
+ */
+function compareKeys(a: unknown, b: unknown): number {
+  if (
+    (typeof a === "string" && typeof b === "string") ||
+    (typeof a === "number" && typeof b === "number")
+  ) {
+    return a === b ? 0 : a < b ? -1 : 1;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    const shared = Math.min(a.length, b.length);
+    for (let i = 0; i < shared; i++) {
+      const order = compareKeys(a[i], b[i]);
+      if (order !== 0) return order;
+    }
+    return a.length - b.length;
+  }
+  return keyOrder.cmp(a, b);
+}
+
+/**
+ * Replaces the contents of a fake-indexeddb RecordStore with `records`, an order of magnitude
+ * faster than putting them one by one: no tree walk or rebalancing per record. SQLite's order is
+ * the right one for most keys but not all (2 sorts after 10 as text), so it is checked.
+ */
+function bulkLoad(recordStore: Raw, records: Raw[], compare: (a: Raw, b: Raw) => number): void {
+  for (let i = 1; i < records.length; i++) {
+    if (compare(records[i - 1], records[i]) > 0) {
+      records.sort(compare);
+      break;
+    }
+  }
+  const tree = recordStore.records;
+  tree._root = tree._rebuild(records, undefined, false);
+  tree._numNodes = records.length;
+  tree._numTombstones = 0;
+}
+
 function prepareStatements(sqlite: SyncSqlite) {
   const prepare = (sql: string) => sqlite.prepare(sql);
   return {
@@ -112,7 +159,9 @@ function prepareStatements(sqlite: SyncSqlite) {
     schema: prepare("SELECT schema FROM idb_database WHERE name = ?"),
     putSchema: prepare("INSERT OR REPLACE INTO idb_database (name, schema) VALUES (?, ?)"),
     deleteSchema: prepare("DELETE FROM idb_database WHERE name = ?"),
-    records: prepare("SELECT key, value FROM idb_record WHERE store = ?"),
+    // In primary key order, so that a store whose keys sort the same way as IndexedDB's needs
+    // no sorting in JavaScript (see bulkLoad).
+    records: prepare("SELECT key, value FROM idb_record WHERE store = ? ORDER BY key"),
     putRecord: prepare("INSERT OR REPLACE INTO idb_record (store, key, value) VALUES (?, ?, ?)"),
     deleteRecord: prepare("DELETE FROM idb_record WHERE store = ? AND key = ?"),
     deleteStore: prepare("DELETE FROM idb_record WHERE store = ?"),
@@ -125,6 +174,8 @@ class Persistence {
     hydratedDatabases: 0,
     hydratedRecords: 0,
     hydrateMs: 0,
+    indexBuilds: 0,
+    indexBuildMs: 0,
     commits: 0,
     writtenRecords: 0,
     deletedRecords: 0,
@@ -225,16 +276,17 @@ class Persistence {
       if (store.keyGenerator && s.keyGenerator !== null) store.keyGenerator.num = s.keyGenerator;
       this.storeIds.set(store, s.id);
       ids.add(s.id);
-      for (const record of this.sql.records.all([s.id])) {
-        store.records.put({
-          key: decodeKey(String(record.key)),
-          value: decodeValue(String(record.value)),
-        });
-        this.stats.hydratedRecords++;
-      }
+      const records = this.sql.records.all([s.id]).map((record) => ({
+        key: decodeKey(String(record.key)),
+        value: decodeValue(String(record.value)),
+      }));
+      bulkLoad(store.records, records, (a, b) => compareKeys(a.key, b.key));
+      this.stats.hydratedRecords += records.length;
       for (const ix of s.indexes) {
         const index = new Index(store, ix.name, ix.keyPath, ix.multiEntry, ix.unique);
-        for (const record of store.records.values()) index.storeRecord(record);
+        // A unique index has to exist to reject a duplicate, so there is nothing to defer.
+        if (ix.unique) this.buildIndex(index, store);
+        else this.deferIndex(index, store);
         index.initialized = true;
         store.rawIndexes.set(ix.name, index);
       }
@@ -244,6 +296,58 @@ class Persistence {
     this.factory._databases.set(name, database);
     this.stats.hydratedDatabases++;
     this.stats.hydrateMs += performance.now() - start;
+  }
+
+  /** Fills an index from the current records of its store. */
+  private buildIndex(index: Raw, store: Raw): void {
+    const start = performance.now();
+    const entries: Raw[] = [];
+    for (const record of store.records.values()) {
+      const indexKey = index.getIndexKey(record.value);
+      if (indexKey === undefined) continue;
+      if (index.multiEntry && Array.isArray(indexKey)) {
+        for (const key of indexKey) entries.push({ key, value: record.key });
+      } else {
+        entries.push({ key: indexKey, value: record.key });
+      }
+    }
+    const compare = index.unique
+      ? (a: Raw, b: Raw) => compareKeys(a.key, b.key)
+      : (a: Raw, b: Raw) => compareKeys(a.key, b.key) || compareKeys(a.value, b.value);
+    bulkLoad(index.records, entries, compare);
+    this.stats.indexBuilds++;
+    this.stats.indexBuildMs += performance.now() - start;
+  }
+
+  /**
+   * Leaves a loaded index empty until something reads it. Writes before then are dropped, not
+   * lost: the build reads the store's current records, which include them (and a rollback has
+   * undone them in the store by then, or will undo them through the built index).
+   */
+  private deferIndex(index: Raw, store: Raw): void {
+    const records = index.records;
+    const settle = (value: Raw): void => {
+      delete index.storeRecord;
+      delete index.deleteRecord;
+      Object.defineProperty(index, "records", {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    };
+    index.storeRecord = () => undefined;
+    index.deleteRecord = () => undefined;
+    Object.defineProperty(index, "records", {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        settle(records);
+        this.buildIndex(index, store);
+        return records;
+      },
+      set: settle,
+    });
   }
 
   /** The keys a transaction has touched in a store, collected until it commits. */
