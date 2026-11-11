@@ -1,6 +1,7 @@
 // The workload this package was written for: matrix-js-sdk's Rust crypto store
 // (@matrix-org/matrix-sdk-crypto-wasm, which reaches IndexedDB through wasm-bindgen), kept
-// across a restart, both unencrypted and encrypted with a passphrase.
+// across a restart, both unencrypted and encrypted with a passphrase, and with every
+// fake-indexeddb task deferred to a later turn of the event loop (sliceMs 0).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -11,8 +12,13 @@ import { start, tempDatabaseFile } from "./helpers.ts";
 
 await Crypto.initAsync();
 
-for (const passphrase of [undefined, "correct horse battery staple"]) {
-  test(`the crypto store survives a restart (${passphrase ? "encrypted" : "unencrypted"})`, async () => {
+for (const [passphrase, sliceMs] of [
+  [undefined, 8],
+  ["correct horse battery staple", 8],
+  [undefined, 0],
+] as const) {
+  const name = `${passphrase ? "encrypted" : "unencrypted"}, sliceMs ${sliceMs}`;
+  test(`the crypto store survives a restart (${name})`, async () => {
     const file = tempDatabaseFile();
     const user = new Crypto.UserId("@alice:example.org");
     const device = new Crypto.DeviceId("DEVICE");
@@ -25,7 +31,7 @@ for (const passphrase of [undefined, "correct horse battery staple"]) {
       );
 
     // The crypto glue looks up the global indexedDB, so each instance installs itself globally.
-    await start(file, { target: globalThis });
+    await start(file, { target: globalThis, sliceMs });
     let machine = await machineOn();
     const identity = machine.identityKeys.ed25519.toBase64();
     for (const room of rooms)
@@ -47,7 +53,7 @@ for (const passphrase of [undefined, "correct horse battery staple"]) {
     );
     machine.close();
 
-    await start(file, { target: globalThis });
+    await start(file, { target: globalThis, sliceMs });
     machine = await machineOn();
     assert.equal(machine.identityKeys.ed25519.toBase64(), identity);
     const settings = new Crypto.DecryptionSettings(Crypto.TrustRequirement.Untrusted);

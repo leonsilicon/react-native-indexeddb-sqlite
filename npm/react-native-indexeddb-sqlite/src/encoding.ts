@@ -7,6 +7,11 @@
 // Values have a fast path for plain JSON ("J" + JSON) and a tagged path ("T" + JSON) for what
 // JSON cannot represent: undefined, NaN/Infinity/-0, BigInt, Date, RegExp, ArrayBuffer, typed
 // arrays and DataView, Map, Set, and sparse arrays.
+//
+// A record's binary data (ArrayBuffers and typed arrays) is stored as a BLOB next to its text,
+// which refers to it by offset and length (`encodeRecordValue`): copying bytes is much cheaper
+// than building and parsing base64 in JavaScript. Records written before kept their bytes as
+// base64 in the text, which still decodes.
 
 const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_LOOKUP = new Uint8Array(128);
@@ -109,11 +114,24 @@ type Tagged =
   | { $: "re"; s: string; f: string }
   | { $: "ab"; v: string }
   | { $: "tv"; c: string; v: string }
+  | { $: "AB"; o: number; l: number }
+  | { $: "TV"; c: string; o: number; l: number }
   | { $: "m"; v: [Tagged, Tagged][] }
   | { $: "s"; v: Tagged[] }
   | { $: "o"; v: Record<string, Tagged> };
 
-function tag(value: unknown): Tagged {
+/** Where `tag` puts binary data: base64 in the text (`null`), or byte ranges of the BLOB. */
+type Parts = { chunks: Uint8Array[]; length: number } | null;
+
+function binary(bytes: Uint8Array, parts: Parts): { o: number; l: number } | { v: string } {
+  if (!parts) return { v: toBase64(bytes) };
+  const o = parts.length;
+  parts.chunks.push(bytes);
+  parts.length += bytes.byteLength;
+  return { o, l: bytes.byteLength };
+}
+
+function tag(value: unknown, parts: Parts = null): Tagged {
   switch (typeof value) {
     case "undefined":
       return { $: "u" };
@@ -136,24 +154,48 @@ function tag(value: unknown): Tagged {
     return {
       $: "a",
       v: Array.from({ length: value.length }, (_, i) =>
-        i in value ? tag(value[i]) : { $: "hole" },
+        i in value ? tag(value[i], parts) : { $: "hole" },
       ),
     };
   }
   if (value instanceof Date) return { $: "d", v: value.getTime() };
   if (value instanceof RegExp) return { $: "re", s: value.source, f: value.flags };
-  if (value instanceof ArrayBuffer) return { $: "ab", v: toBase64(new Uint8Array(value)) };
-  if (ArrayBuffer.isView(value))
-    return { $: "tv", c: value.constructor.name, v: toBase64(viewBytes(value)) };
-  if (value instanceof Map)
-    return { $: "m", v: [...value].map(([k, v]): [Tagged, Tagged] => [tag(k), tag(v)]) };
-  if (value instanceof Set) return { $: "s", v: [...value].map(tag) };
+  if (value instanceof ArrayBuffer) {
+    const data = binary(new Uint8Array(value), parts);
+    return "v" in data ? { $: "ab", v: data.v } : { $: "AB", ...data };
+  }
+  if (ArrayBuffer.isView(value)) {
+    const c = value.constructor.name;
+    const data = binary(viewBytes(value), parts);
+    return "v" in data ? { $: "tv", c, v: data.v } : { $: "TV", c, ...data };
+  }
+  if (value instanceof Map) {
+    return {
+      $: "m",
+      v: [...value].map(([k, v]): [Tagged, Tagged] => [tag(k, parts), tag(v, parts)]),
+    };
+  }
+  if (value instanceof Set) return { $: "s", v: [...value].map((item) => tag(item, parts)) };
   const out: Record<string, Tagged> = {};
-  for (const key of Object.keys(value)) out[key] = tag((value as Record<string, unknown>)[key]);
+  for (const key of Object.keys(value))
+    out[key] = tag((value as Record<string, unknown>)[key], parts);
   return { $: "o", v: out };
 }
 
-function untag(value: Tagged): unknown {
+function view(c: string, buffer: ArrayBuffer): ArrayBufferView {
+  const View = VIEW_CONSTRUCTORS[c];
+  if (!View) throw new TypeError(`react-native-indexeddb-sqlite: unknown view type ${c}`);
+  return new View(buffer);
+}
+
+function blobBytes(blob: Uint8Array | null, o: number, l: number): ArrayBuffer {
+  if (!blob || o + l > blob.byteLength) {
+    throw new TypeError("react-native-indexeddb-sqlite: a record's binary data is missing");
+  }
+  return bufferOf(blob.subarray(o, o + l));
+}
+
+function untag(value: Tagged, blob: Uint8Array | null): unknown {
   if (value === null || typeof value !== "object") return value;
   switch (value.$) {
     case "u":
@@ -167,7 +209,8 @@ function untag(value: Tagged): unknown {
       const out: unknown[] = [];
       out.length = value.v.length; // all holes; the loop fills every index that was not one
       value.v.forEach((item, i) => {
-        if (typeof item !== "object" || item === null || item.$ !== "hole") out[i] = untag(item);
+        if (typeof item !== "object" || item === null || item.$ !== "hole")
+          out[i] = untag(item, blob);
       });
       return out;
     }
@@ -177,30 +220,66 @@ function untag(value: Tagged): unknown {
       return new RegExp(value.s, value.f);
     case "ab":
       return bufferOf(fromBase64(value.v));
-    case "tv": {
-      const View = VIEW_CONSTRUCTORS[value.c];
-      if (!View) throw new TypeError(`react-native-indexeddb-sqlite: unknown view type ${value.c}`);
-      return new View(bufferOf(fromBase64(value.v)));
-    }
+    case "tv":
+      return view(value.c, bufferOf(fromBase64(value.v)));
+    case "AB":
+      return blobBytes(blob, value.o, value.l);
+    case "TV":
+      return view(value.c, blobBytes(blob, value.o, value.l));
     case "m":
-      return new Map(value.v.map(([k, v]) => [untag(k), untag(v)]));
+      return new Map(value.v.map(([k, v]) => [untag(k, blob), untag(v, blob)]));
     case "s":
-      return new Set(value.v.map(untag));
+      return new Set(value.v.map((item) => untag(item, blob)));
     case "o": {
       const out: Record<string, unknown> = {};
-      for (const key of Object.keys(value.v)) out[key] = untag(value.v[key]);
+      for (const key of Object.keys(value.v)) out[key] = untag(value.v[key], blob);
       return out;
     }
   }
 }
 
+/** A value as one string, binary data included as base64. */
 export function encodeValue(value: unknown): string {
   return isPlainJson(value) ? "J" + JSON.stringify(value) : "T" + JSON.stringify(tag(value));
 }
 
-export function decodeValue(text: string): unknown {
+/**
+ * Decodes what `encodeValue` or `encodeRecordValue` produced. `blob` is the binary data
+ * `encodeRecordValue` returned with the text, if any.
+ */
+export function decodeValue(text: string, blob?: Uint8Array | null): unknown {
   const body: unknown = JSON.parse(text.slice(1));
-  return text[0] === "J" ? body : untag(body as Tagged);
+  return text[0] === "J" ? body : untag(body as Tagged, blob ?? null);
+}
+
+/**
+ * A value as text plus, when it holds binary data, a BLOB of the bytes, which the text refers
+ * to by offset and length. `json` is the value's JSON text, when the caller already has it.
+ */
+export function encodeRecordValue(
+  value: unknown,
+  json?: string,
+): [text: string, blob: Uint8Array | null] {
+  if (json !== undefined) return ["J" + json, null];
+  if (isPlainJson(value)) return ["J" + JSON.stringify(value), null];
+  const parts = { chunks: [] as Uint8Array[], length: 0 };
+  const text = "T" + JSON.stringify(tag(value, parts));
+  const { chunks } = parts;
+  if (chunks.length === 0) return [text, null];
+  // SQLite copies the bytes it binds, so a lone chunk can go as it is unless it views part of
+  // a larger buffer (some bindings send the whole buffer).
+  if (chunks.length === 1) {
+    const only = chunks[0]!;
+    const whole = only.byteOffset === 0 && only.byteLength === only.buffer.byteLength;
+    return [text, whole ? only : only.slice()];
+  }
+  const blob = new Uint8Array(parts.length);
+  let at = 0;
+  for (const chunk of chunks) {
+    blob.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return [text, blob];
 }
 
 // IndexedDB keys: number, string, Date, binary, and arrays of those.

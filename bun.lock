@@ -24,6 +24,9 @@
       },
     },
   },
+  "patchedDependencies": {
+    "fake-indexeddb@6.2.7": "npm/react-native-indexeddb-sqlite/patches/fake-indexeddb@6.2.7.patch",
+  },
   "catalog": {
     "@matrix-org/matrix-sdk-crypto-wasm": "18.9.0",
     "@types/node": "24.19.2",

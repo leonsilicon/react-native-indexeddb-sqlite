@@ -1,0 +1,162 @@
+diff --git a/build/cjs/FDBCursor.js b/build/cjs/FDBCursor.js
+index e4db347a8eb6da3ccd9cb69f2e361a10af951419..24b5da26c42632da4adc6abcf9540e39e246115f 100644
+--- a/build/cjs/FDBCursor.js
++++ b/build/cjs/FDBCursor.js
+@@ -13,6 +13,10 @@ var _valueToKey = _interopRequireDefault(require("./lib/valueToKey.js"));
+ var _cloneValueForInsertion = require("./lib/cloneValueForInsertion.js");
+ function _interopRequireWildcard(e, t) { if ("function" == typeof WeakMap) var r = new WeakMap(), n = new WeakMap(); return (_interopRequireWildcard = function (e, t) { if (!t && e && e.__esModule) return e; var o, i, f = { __proto__: null, default: e }; if (null === e || "object" != typeof e && "function" != typeof e) return f; if (o = t ? n : r) { if (o.has(e)) return o.get(e); o.set(e, f); } for (const t in e) "default" !== t && {}.hasOwnProperty.call(e, t) && ((i = (o = Object.defineProperty) && Object.getOwnPropertyDescriptor(e, t)) && (i.get || i.set) ? o(f, t, i) : f[t] = e[t]); return f; })(e, t); }
+ function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
++// react-native-indexeddb-sqlite: an embedder can replace the clone by defining
++// globalThis[Symbol.for("fake-indexeddb.structuredClone")].
++const structuredClone = value => (globalThis[Symbol.for("fake-indexeddb.structuredClone")] ?? globalThis.structuredClone)(value);
++
+ const getEffectiveObjectStore = cursor => {
+   if (cursor.source instanceof _FDBObjectStore.default) {
+     return cursor.source;
+diff --git a/build/cjs/lib/Index.js b/build/cjs/lib/Index.js
+index 015605e58b02af8f7e8ee3de0e1f6d6f5a5a0a11..f72e3c3c43cc9d73887363577382e163b1d6292c 100644
+--- a/build/cjs/lib/Index.js
++++ b/build/cjs/lib/Index.js
+@@ -10,6 +10,10 @@ var _extractKey = _interopRequireDefault(require("./extractKey.js"));
+ var _RecordStore = _interopRequireDefault(require("./RecordStore.js"));
+ var _valueToKey = _interopRequireDefault(require("./valueToKey.js"));
+ function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
++// react-native-indexeddb-sqlite: an embedder can replace the clone by defining
++// globalThis[Symbol.for("fake-indexeddb.structuredClone")].
++const structuredClone = value => (globalThis[Symbol.for("fake-indexeddb.structuredClone")] ?? globalThis.structuredClone)(value);
++
+ // http://www.w3.org/TR/2015/REC-IndexedDB-20150108/#dfn-index
+ class Index {
+   deleted = false;
+diff --git a/build/cjs/lib/ObjectStore.js b/build/cjs/lib/ObjectStore.js
+index a3b111375e6eb3ecaedcfd8572d7ac7efc5afba5..480a72d00bc7b5c9572721855db5174713bf54e6 100644
+--- a/build/cjs/lib/ObjectStore.js
++++ b/build/cjs/lib/ObjectStore.js
+@@ -10,6 +10,10 @@ var _extractKey = _interopRequireDefault(require("./extractKey.js"));
+ var _KeyGenerator = _interopRequireDefault(require("./KeyGenerator.js"));
+ var _RecordStore = _interopRequireDefault(require("./RecordStore.js"));
+ function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
++// react-native-indexeddb-sqlite: an embedder can replace the clone by defining
++// globalThis[Symbol.for("fake-indexeddb.structuredClone")].
++const structuredClone = value => (globalThis[Symbol.for("fake-indexeddb.structuredClone")] ?? globalThis.structuredClone)(value);
++
+ // http://www.w3.org/TR/2015/REC-IndexedDB-20150108/#dfn-object-store
+ class ObjectStore {
+   deleted = false;
+diff --git a/build/cjs/lib/cloneValueForInsertion.js b/build/cjs/lib/cloneValueForInsertion.js
+index 39369ea8cd7c12ce9178fdfb6384282e472c110a..8fab8264260b068092ffeeb77af3ea775b8c0e28 100644
+--- a/build/cjs/lib/cloneValueForInsertion.js
++++ b/build/cjs/lib/cloneValueForInsertion.js
+@@ -22,7 +22,9 @@ function cloneValueForInsertion(value, transaction) {
+     // Let serialized be StructuredSerializeForStorage(value).
+     // Let clone be ? StructuredDeserialize(serialized, targetRealm).
+     // Return clone.
+-    return structuredClone(value);
++    // react-native-indexeddb-sqlite: an embedder's clone also learns that this one is stored.
++    const hook = globalThis[Symbol.for("fake-indexeddb.structuredClone")];
++    return hook ? hook(value, true) : structuredClone(value);
+   } finally {
+     // Set transaction’s state to active.
+     transaction._state = "active";
+diff --git a/build/cjs/lib/scheduling.js b/build/cjs/lib/scheduling.js
+index 4390406c2aa2744738b0bbe7783d5382bbc78cff..4dd8712443d9ee232ee37ea2152973f423df2cfc 100644
+--- a/build/cjs/lib/scheduling.js
++++ b/build/cjs/lib/scheduling.js
+@@ -39,7 +39,17 @@ const doSetTimeout = fn => setTimeout(fn, 0);
+ // transactions are marked as not active when the event loop runs. The next
+ // tick queue and microtask queue run within the current event loop macrotask,
+ // so they'd process database operations too quickly.
++//
++// react-native-indexeddb-sqlite: an embedder can replace this scheduler by defining
++// globalThis[Symbol.for("fake-indexeddb.queueTask")]. On React Native, setImmediate is a microtask,
++// so a chain of requests would otherwise never let the event loop turn.
++const queueTaskHook = Symbol.for("fake-indexeddb.queueTask");
+ const queueTask = fn => {
++  const hook = globalThis[queueTaskHook];
++  if (hook) {
++    hook(fn);
++    return;
++  }
+   const setImmediate = globalThis.setImmediate || getSetImmediateFromJsdom() || schedulerPostTask || doSetTimeout;
+   setImmediate(fn);
+ };
+diff --git a/build/esm/FDBCursor.js b/build/esm/FDBCursor.js
+index ef1fb8a978f29b8c112b8cac53f1dc2aa5d061c4..be582fec224b44e5faa20cc84b3b4126507374f8 100644
+--- a/build/esm/FDBCursor.js
++++ b/build/esm/FDBCursor.js
+@@ -5,6 +5,9 @@ import { DataError, InvalidAccessError, InvalidStateError, ReadOnlyError, Transa
+ import extractKey from "./lib/extractKey.js";
+ import valueToKey from "./lib/valueToKey.js";
+ import { cloneValueForInsertion } from "./lib/cloneValueForInsertion.js";
++// react-native-indexeddb-sqlite: an embedder can replace the clone by defining
++// globalThis[Symbol.for("fake-indexeddb.structuredClone")].
++const structuredClone = value => (globalThis[Symbol.for("fake-indexeddb.structuredClone")] ?? globalThis.structuredClone)(value);
+ const getEffectiveObjectStore = cursor => {
+   if (cursor.source instanceof FDBObjectStore) {
+     return cursor.source;
+diff --git a/build/esm/lib/Index.js b/build/esm/lib/Index.js
+index 878814cdd65fe6e9d74b67142f5b466219980731..d124fba71448889c30eb56eb3bf294c13613519d 100644
+--- a/build/esm/lib/Index.js
++++ b/build/esm/lib/Index.js
+@@ -3,6 +3,9 @@ import { ConstraintError } from "./errors.js";
+ import extractKey from "./extractKey.js";
+ import RecordStore from "./RecordStore.js";
+ import valueToKey from "./valueToKey.js";
++// react-native-indexeddb-sqlite: an embedder can replace the clone by defining
++// globalThis[Symbol.for("fake-indexeddb.structuredClone")].
++const structuredClone = value => (globalThis[Symbol.for("fake-indexeddb.structuredClone")] ?? globalThis.structuredClone)(value);
+ // http://www.w3.org/TR/2015/REC-IndexedDB-20150108/#dfn-index
+ class Index {
+   deleted = false;
+diff --git a/build/esm/lib/ObjectStore.js b/build/esm/lib/ObjectStore.js
+index 7cd61b479025d7411bd187e015c6fe259a6a4a60..8ed1afcdb0c06aac78ac97d5dfa2ee87b066fc87 100644
+--- a/build/esm/lib/ObjectStore.js
++++ b/build/esm/lib/ObjectStore.js
+@@ -3,6 +3,9 @@ import { DataError } from "./errors.js";
+ import extractKey from "./extractKey.js";
+ import KeyGenerator from "./KeyGenerator.js";
+ import RecordStore from "./RecordStore.js";
++// react-native-indexeddb-sqlite: an embedder can replace the clone by defining
++// globalThis[Symbol.for("fake-indexeddb.structuredClone")].
++const structuredClone = value => (globalThis[Symbol.for("fake-indexeddb.structuredClone")] ?? globalThis.structuredClone)(value);
+ // http://www.w3.org/TR/2015/REC-IndexedDB-20150108/#dfn-object-store
+ class ObjectStore {
+   deleted = false;
+diff --git a/build/esm/lib/cloneValueForInsertion.js b/build/esm/lib/cloneValueForInsertion.js
+index 37aa4fb4c8062f141743190b208c2d76d0091634..70fcec142cac47d29b63abfdef0d9e75e5c6a320 100644
+--- a/build/esm/lib/cloneValueForInsertion.js
++++ b/build/esm/lib/cloneValueForInsertion.js
+@@ -16,7 +16,9 @@ export function cloneValueForInsertion(value, transaction) {
+     // Let serialized be StructuredSerializeForStorage(value).
+     // Let clone be ? StructuredDeserialize(serialized, targetRealm).
+     // Return clone.
+-    return structuredClone(value);
++    // react-native-indexeddb-sqlite: an embedder's clone also learns that this one is stored.
++    const hook = globalThis[Symbol.for("fake-indexeddb.structuredClone")];
++    return hook ? hook(value, true) : structuredClone(value);
+   } finally {
+     // Set transaction’s state to active.
+     transaction._state = "active";
+diff --git a/build/esm/lib/scheduling.js b/build/esm/lib/scheduling.js
+index ed18e601701af1ac4054576226043dc99960a8cb..d235ba5e7be43320ab3f38d2582305d46daa44f1 100644
+--- a/build/esm/lib/scheduling.js
++++ b/build/esm/lib/scheduling.js
+@@ -33,7 +33,17 @@ const doSetTimeout = fn => setTimeout(fn, 0);
+ // transactions are marked as not active when the event loop runs. The next
+ // tick queue and microtask queue run within the current event loop macrotask,
+ // so they'd process database operations too quickly.
++//
++// react-native-indexeddb-sqlite: an embedder can replace this scheduler by defining
++// globalThis[Symbol.for("fake-indexeddb.queueTask")]. On React Native, setImmediate is a microtask,
++// so a chain of requests would otherwise never let the event loop turn.
++const queueTaskHook = Symbol.for("fake-indexeddb.queueTask");
+ export const queueTask = fn => {
++  const hook = globalThis[queueTaskHook];
++  if (hook) {
++    hook(fn);
++    return;
++  }
+   const setImmediate = globalThis.setImmediate || getSetImmediateFromJsdom() || schedulerPostTask || doSetTimeout;
+   setImmediate(fn);
+ };
+\ No newline at end of file

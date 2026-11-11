@@ -1,6 +1,6 @@
 {
   "name": "react-native-indexeddb-sqlite",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A persistent IndexedDB for React Native: fake-indexeddb in memory, written through to SQLite (expo-sqlite's synchronous API).",
   "keywords": [
     "expo",
@@ -23,6 +23,7 @@
   "files": [
     "dist",
     "src",
+    "patches",
     "README.md",
     "LICENSE"
   ],
